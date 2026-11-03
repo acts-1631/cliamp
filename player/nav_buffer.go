@@ -23,9 +23,21 @@ const readStallTimeout = 5 * time.Second
 var (
 	errNavBufferClosed      = errors.New("nav buffer: closed")
 	errNavBufferReadStalled = errors.New("nav buffer: read stalled waiting for data")
+	errNavBufferSizeLimit   = errors.New("nav buffer: temporary storage limit reached")
+	errNavBufferDiskReserve = errors.New("nav buffer: temporary filesystem free-space reserve reached")
 )
 
-const navBufferChunkSize = 32 * 1024
+const (
+	navBufferChunkSize                 = 32 * 1024
+	navBufferMaxBytes           int64  = 8 << 30 // shared by current and preloaded tracks
+	navBufferMinFreeBytes       uint64 = 512 << 20
+	navBufferSpaceCheckInterval        = 8 << 20
+)
+
+// navBufferBytes bounds all navigation buffers in the process, including a
+// preloaded next track. Bytes remain charged until Close removes the temporary
+// file.
+var navBufferBytes atomic.Int64
 
 // navBuffer is a progressive download backed by a temporary file. Bytes are
 // written to the file as they arrive. Each ffmpeg process reads through its
@@ -35,22 +47,24 @@ const navBufferChunkSize = 32 * 1024
 // Lock ordering: navBuffer.mu is a leaf lock. It must never be acquired
 // while holding speaker.Lock() or player.mu.
 type navBuffer struct {
-	mu           sync.Mutex
-	readMu       sync.Mutex // serializes file reads against Close without blocking downloads
-	wait         chan struct{}
-	downloadDone chan struct{}
-	file         *os.File
-	path         string
-	downloaded   int64 // bytes available in file
-	total        int64 // Content-Length from HTTP response (-1 if unknown)
-	done         bool  // true when download goroutine has finished
-	err          error // first error from download goroutine
-	closed       bool
-	cancel       context.CancelFunc
-	bytesIn      atomic.Int64 // mirrors downloaded; safe for unsynchronised UI reads
-	stallTimeout time.Duration
-	closeOnce    sync.Once
-	closeErr     error
+	mu             sync.Mutex
+	readMu         sync.Mutex // serializes file reads against Close without blocking downloads
+	wait           chan struct{}
+	downloadDone   chan struct{}
+	file           *os.File
+	path           string
+	downloaded     int64 // bytes available in file
+	total          int64 // Content-Length from HTTP response (-1 if unknown)
+	done           bool  // true when download goroutine has finished
+	err            error // first error from download goroutine
+	closed         bool
+	cancel         context.CancelFunc
+	bytesIn        atomic.Int64 // mirrors downloaded; safe for unsynchronised UI reads
+	chargedBytes   int64        // process quota held until Close; download goroutine owns writes
+	nextSpaceCheck int64        // downloaded offset for the next free-space check
+	stallTimeout   time.Duration
+	closeOnce      sync.Once
+	closeErr       error
 }
 
 // newNavBuffer opens an HTTP GET request for rawURL, starts downloading in a
@@ -125,21 +139,43 @@ func navBufferGet(ctx context.Context, rawURL string) (*http.Response, error) {
 // newNavBufferFor builds the file-backed buffer for an opened response.
 // On error the response body is closed and cancel invoked.
 func newNavBufferFor(resp *http.Response, cancel context.CancelFunc) (*navBuffer, error) {
+	if resp.ContentLength > navBufferMaxBytes {
+		resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf(
+			"%w: server declared %d bytes, limit is %d",
+			errNavBufferSizeLimit, resp.ContentLength, navBufferMaxBytes,
+		)
+	}
+
 	file, err := os.CreateTemp("", "cliamp-nav-*")
 	if err != nil {
 		resp.Body.Close()
 		cancel()
 		return nil, fmt.Errorf("nav buffer tempfile: %w", err)
 	}
+	required := uint64(navBufferSpaceCheckInterval)
+	if resp.ContentLength > 0 {
+		required = uint64(resp.ContentLength)
+	}
+	if err := ensureNavBufferDiskSpace(file.Name(), required); err != nil {
+		path := file.Name()
+		_ = file.Close()
+		_ = os.Remove(path)
+		resp.Body.Close()
+		cancel()
+		return nil, err
+	}
 
 	return &navBuffer{
-		total:        resp.ContentLength, // -1 if unknown
-		cancel:       cancel,
-		wait:         make(chan struct{}),
-		downloadDone: make(chan struct{}),
-		file:         file,
-		path:         file.Name(),
-		stallTimeout: readStallTimeout,
+		total:          resp.ContentLength, // -1 if unknown
+		cancel:         cancel,
+		wait:           make(chan struct{}),
+		downloadDone:   make(chan struct{}),
+		file:           file,
+		path:           file.Name(),
+		nextSpaceCheck: navBufferSpaceCheckInterval,
+		stallTimeout:   readStallTimeout,
 	}, nil
 }
 
@@ -164,6 +200,20 @@ func (b *navBuffer) downloadSegments(ctx context.Context, first io.ReadCloser, r
 	for _, u := range rest {
 		resp, err := navBufferGet(ctx, u)
 		if err != nil {
+			b.finish(err)
+			return
+		}
+		required := uint64(navBufferSpaceCheckInterval)
+		if resp.ContentLength > 0 {
+			if resp.ContentLength > navBufferMaxBytes-offset {
+				resp.Body.Close()
+				b.finish(fmt.Errorf("%w: segment exceeds remaining quota", errNavBufferSizeLimit))
+				return
+			}
+			required = uint64(resp.ContentLength)
+		}
+		if err := ensureNavBufferDiskSpace(b.path, required); err != nil {
+			resp.Body.Close()
 			b.finish(err)
 			return
 		}
@@ -200,7 +250,17 @@ func (b *navBuffer) copyBody(body io.ReadCloser, offset int64) (int64, bool) {
 					return offset, false
 				}
 
-				wn, writeErr := file.WriteAt(chunk[written:n], offset)
+				part := chunk[written:n]
+				if err := b.reserveWrite(offset, len(part)); err != nil {
+					b.finish(err)
+					return offset, false
+				}
+				wn, writeErr := file.WriteAt(part, offset)
+				if wn < len(part) {
+					refunded := int64(len(part) - wn)
+					releaseNavBufferBytes(refunded)
+					b.chargedBytes -= refunded
+				}
 				if wn > 0 {
 					written += wn
 					offset += int64(wn)
@@ -224,6 +284,53 @@ func (b *navBuffer) copyBody(body io.ReadCloser, offset int64) (int64, bool) {
 			return offset, false
 		}
 	}
+}
+
+func (b *navBuffer) reserveWrite(offset int64, size int) error {
+	end := offset + int64(size)
+	if offset < 0 || size < 0 || end < offset || end > navBufferMaxBytes {
+		return errNavBufferSizeLimit
+	}
+	if end >= b.nextSpaceCheck {
+		if err := ensureNavBufferDiskSpace(b.path, uint64(navBufferSpaceCheckInterval)); err != nil {
+			return err
+		}
+		b.nextSpaceCheck = end + navBufferSpaceCheckInterval
+	}
+	if !reserveNavBufferBytes(int64(size)) {
+		return errNavBufferSizeLimit
+	}
+	b.chargedBytes += int64(size)
+	return nil
+}
+
+func reserveNavBufferBytes(size int64) bool {
+	for {
+		used := navBufferBytes.Load()
+		if size < 0 || used > navBufferMaxBytes-size {
+			return false
+		}
+		if navBufferBytes.CompareAndSwap(used, used+size) {
+			return true
+		}
+	}
+}
+
+func releaseNavBufferBytes(size int64) {
+	if size > 0 {
+		navBufferBytes.Add(-size)
+	}
+}
+
+func ensureNavBufferDiskSpace(path string, required uint64) error {
+	available, err := availableDiskBytes(path)
+	if err != nil {
+		return fmt.Errorf("nav buffer free space: %w", err)
+	}
+	if available < navBufferMinFreeBytes+required {
+		return errNavBufferDiskReserve
+	}
+	return nil
 }
 
 func (b *navBuffer) publish(downloaded int64) {
@@ -478,6 +585,7 @@ func (b *navBuffer) Close() error {
 				removeErr = nil
 			}
 		}
+		releaseNavBufferBytes(b.chargedBytes)
 		b.closeErr = errors.Join(closeErr, removeErr)
 		b.readMu.Unlock()
 	})
